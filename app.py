@@ -633,18 +633,27 @@ def parse_uploaded_file(uploaded_file):
         elif filename.endswith('.sdf'):
             # Read SDF file using RDKit
             if RDKIT_AVAILABLE:
-                content = uploaded_file.read().decode('utf-8')
-                suppl = Chem.SDMolSupplier()
-                suppl.SetData(content)
+                import tempfile
+                # Write to temporary file for RDKit to read
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.sdf', delete=False) as tmp:
+                    content = uploaded_file.read().decode('utf-8')
+                    tmp.write(content)
+                    tmp_path = tmp.name
                 
-                for idx, mol in enumerate(suppl):
-                    if mol is not None:
-                        smiles = Chem.MolToSmiles(mol)
-                        # Try to get name from molecule properties
-                        name = mol.GetProp('_Name') if mol.HasProp('_Name') else f"Molecule_{idx+1}"
-                        if not name or name.strip() == '':
-                            name = f"Molecule_{idx+1}"
-                        smiles_list.append((smiles, name))
+                try:
+                    suppl = Chem.SDMolSupplier(tmp_path)
+                    
+                    for idx, mol in enumerate(suppl):
+                        if mol is not None:
+                            smiles = Chem.MolToSmiles(mol)
+                            # Try to get name from molecule properties
+                            name = mol.GetProp('_Name') if mol.HasProp('_Name') else f"Molecule_{idx+1}"
+                            if not name or name.strip() == '':
+                                name = f"Molecule_{idx+1}"
+                            smiles_list.append((smiles, name))
+                finally:
+                    # Clean up temporary file
+                    os.unlink(tmp_path)
             else:
                 return None, "RDKit required for SDF files"
         
