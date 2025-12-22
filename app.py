@@ -567,6 +567,165 @@ def resolve_input(user_input):
 
 
 # ============================================================================
+# FILE UPLOAD & BATCH PROCESSING
+# ============================================================================
+def parse_uploaded_file(uploaded_file):
+    """Parse uploaded file and extract SMILES strings."""
+    filename = uploaded_file.name.lower()
+    smiles_list = []
+    
+    try:
+        if filename.endswith('.csv'):
+            # Read CSV file
+            df = pd.read_csv(uploaded_file)
+            # Look for SMILES column (case-insensitive)
+            smiles_col = None
+            for col in df.columns:
+                if col.lower() in ['smiles', 'smile', 'smi', 'structure']:
+                    smiles_col = col
+                    break
+            
+            if smiles_col is None:
+                # Try to use the first column
+                smiles_col = df.columns[0]
+            
+            # Extract SMILES and optional names
+            for idx, row in df.iterrows():
+                smiles = str(row[smiles_col]).strip()
+                if smiles and smiles.lower() != 'nan':
+                    # Try to get name from second column if available
+                    name = None
+                    if len(df.columns) > 1:
+                        name_col = [c for c in df.columns if c.lower() in ['name', 'compound', 'molecule', 'id']]
+                        if name_col:
+                            name = str(row[name_col[0]]).strip()
+                        elif df.columns[1] != smiles_col:
+                            name = str(row[df.columns[1]]).strip()
+                    
+                    if not name or name.lower() == 'nan':
+                        name = f"Molecule_{idx+1}"
+                    
+                    smiles_list.append((smiles, name))
+        
+        elif filename.endswith('.txt'):
+            # Read text file (one SMILES per line)
+            content = uploaded_file.read().decode('utf-8')
+            lines = content.strip().split('\n')
+            for idx, line in enumerate(lines):
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    # Check if line has tab or comma separator
+                    if '\t' in line:
+                        parts = line.split('\t')
+                        smiles = parts[0].strip()
+                        name = parts[1].strip() if len(parts) > 1 else f"Molecule_{idx+1}"
+                    elif ',' in line:
+                        parts = line.split(',')
+                        smiles = parts[0].strip()
+                        name = parts[1].strip() if len(parts) > 1 else f"Molecule_{idx+1}"
+                    else:
+                        smiles = line
+                        name = f"Molecule_{idx+1}"
+                    
+                    if smiles:
+                        smiles_list.append((smiles, name))
+        
+        elif filename.endswith('.sdf'):
+            # Read SDF file using RDKit
+            if RDKIT_AVAILABLE:
+                content = uploaded_file.read().decode('utf-8')
+                suppl = Chem.SDMolSupplier()
+                suppl.SetData(content)
+                
+                for idx, mol in enumerate(suppl):
+                    if mol is not None:
+                        smiles = Chem.MolToSmiles(mol)
+                        # Try to get name from molecule properties
+                        name = mol.GetProp('_Name') if mol.HasProp('_Name') else f"Molecule_{idx+1}"
+                        if not name or name.strip() == '':
+                            name = f"Molecule_{idx+1}"
+                        smiles_list.append((smiles, name))
+            else:
+                return None, "RDKit required for SDF files"
+        
+        else:
+            return None, f"Unsupported file format: {filename}"
+        
+        if not smiles_list:
+            return None, "No valid SMILES found in file"
+        
+        return smiles_list, None
+    
+    except Exception as e:
+        return None, f"Error parsing file: {str(e)}"
+
+
+def batch_predict(model_info, smiles_list, enumerate_stereo=True, progress_bar=None):
+    """Batch predict BBB permeability for multiple molecules."""
+    results = []
+    
+    for idx, (smiles, name) in enumerate(smiles_list):
+        if progress_bar:
+            progress_bar.progress((idx + 1) / len(smiles_list))
+        
+        # Validate SMILES
+        if not RDKIT_AVAILABLE or Chem.MolFromSmiles(smiles) is None:
+            results.append({
+                'name': name,
+                'smiles': smiles,
+                'score': None,
+                'category': 'Error',
+                'error': 'Invalid SMILES'
+            })
+            continue
+        
+        # Predict
+        try:
+            if enumerate_stereo:
+                result, err = predict_with_stereo_enumeration(model_info, smiles)
+                if result:
+                    score = result['mean']
+                else:
+                    score = None
+            else:
+                score, err = predict_single(model_info, smiles)
+            
+            if score is not None:
+                if score >= 0.6:
+                    category = 'BBB+'
+                elif score >= 0.4:
+                    category = 'BBB+/-'
+                else:
+                    category = 'BBB-'
+                
+                results.append({
+                    'name': name,
+                    'smiles': smiles,
+                    'score': score,
+                    'category': category,
+                    'error': None
+                })
+            else:
+                results.append({
+                    'name': name,
+                    'smiles': smiles,
+                    'score': None,
+                    'category': 'Error',
+                    'error': err or 'Prediction failed'
+                })
+        except Exception as e:
+            results.append({
+                'name': name,
+                'smiles': smiles,
+                'score': None,
+                'category': 'Error',
+                'error': str(e)
+            })
+    
+    return results
+
+
+# ============================================================================
 # MAIN APP
 # ============================================================================
 def main():
@@ -619,6 +778,7 @@ def main():
         st.markdown("""
         - Stereo-aware predictions
         - Stereoisomer enumeration
+        - Batch file upload (CSV/TXT/SDF)
         - Molecular property analysis
         - BBB rule assessment
         """)
@@ -658,6 +818,165 @@ def main():
     # Stereo enumeration option
     enumerate_stereo = st.checkbox("Enumerate stereoisomers", value=True,
                                    help="Predict all possible stereoisomers and show range")
+
+    # File upload section
+    st.markdown("---")
+    st.subheader("Or Upload File for Batch Prediction")
+    
+    uploaded_file = st.file_uploader(
+        "Upload a file containing SMILES",
+        type=['csv', 'txt', 'sdf'],
+        help="Upload CSV (with SMILES column), TXT (one SMILES per line), or SDF file"
+    )
+    
+    if uploaded_file is not None:
+        st.info(f"📄 File: **{uploaded_file.name}** ({uploaded_file.size} bytes)")
+        
+        # Parse file
+        with st.spinner("Parsing file..."):
+            smiles_list, parse_err = parse_uploaded_file(uploaded_file)
+        
+        if parse_err:
+            st.error(f"Error: {parse_err}")
+            st.stop()
+        
+        st.success(f"✅ Found {len(smiles_list)} molecules")
+        
+        # Show preview
+        with st.expander("Preview molecules (first 10)"):
+            preview_data = []
+            for smiles, name in smiles_list[:10]:
+                preview_data.append({'Name': name, 'SMILES': smiles})
+            st.dataframe(pd.DataFrame(preview_data), use_container_width=True)
+        
+        # Batch predict button
+        if st.button("🚀 Run Batch Prediction", type="primary", use_container_width=True):
+            st.markdown("---")
+            st.subheader("Batch Prediction Results")
+            
+            # Progress bar
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # Run batch prediction
+            with st.spinner(f"Predicting {len(smiles_list)} molecules..."):
+                results = batch_predict(model_info, smiles_list, enumerate_stereo, progress_bar)
+            
+            progress_bar.empty()
+            status_text.empty()
+            
+            # Summary statistics
+            successful = [r for r in results if r['error'] is None]
+            failed = [r for r in results if r['error'] is not None]
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total", len(results))
+            with col2:
+                st.metric("Successful", len(successful), delta=None)
+            with col3:
+                st.metric("Failed", len(failed), delta=None)
+            with col4:
+                if successful:
+                    avg_score = np.mean([r['score'] for r in successful])
+                    st.metric("Avg Score", f"{avg_score:.3f}")
+            
+            # Category distribution
+            if successful:
+                st.markdown("### Category Distribution")
+                categories = {}
+                for r in successful:
+                    cat = r['category']
+                    categories[cat] = categories.get(cat, 0) + 1
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("BBB+", categories.get('BBB+', 0))
+                with col2:
+                    st.metric("BBB+/-", categories.get('BBB+/-', 0))
+                with col3:
+                    st.metric("BBB-", categories.get('BBB-', 0))
+            
+            # Results table
+            st.markdown("### Detailed Results")
+            
+            results_df = pd.DataFrame([
+                {
+                    'Name': r['name'],
+                    'SMILES': r['smiles'],
+                    'BBB Score': f"{r['score']:.4f}" if r['score'] is not None else 'N/A',
+                    'Category': r['category'],
+                    'Error': r['error'] if r['error'] else ''
+                }
+                for r in results
+            ])
+            
+            st.dataframe(results_df, use_container_width=True, height=400)
+            
+            # Download batch results
+            st.markdown("---")
+            st.subheader("Download Batch Results")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # CSV export
+                csv_data = []
+                for r in results:
+                    csv_data.append({
+                        'name': r['name'],
+                        'smiles': r['smiles'],
+                        'bbb_score': r['score'] if r['score'] is not None else '',
+                        'category': r['category'],
+                        'error': r['error'] if r['error'] else '',
+                        'model_type': model_info['type'],
+                        'model_name': model_info['name'],
+                        'timestamp': datetime.now().isoformat()
+                    })
+                
+                csv_df = pd.DataFrame(csv_data)
+                st.download_button(
+                    "📥 Download CSV",
+                    csv_df.to_csv(index=False),
+                    "batch_bbb_predictions.csv",
+                    "text/csv",
+                    use_container_width=True
+                )
+            
+            with col2:
+                # JSON export
+                json_data = {
+                    'summary': {
+                        'total': len(results),
+                        'successful': len(successful),
+                        'failed': len(failed),
+                        'model_type': model_info['type'],
+                        'model_name': model_info['name'],
+                        'timestamp': datetime.now().isoformat()
+                    },
+                    'results': [
+                        {
+                            'name': r['name'],
+                            'smiles': r['smiles'],
+                            'bbb_score': r['score'],
+                            'category': r['category'],
+                            'error': r['error']
+                        }
+                        for r in results
+                    ]
+                }
+                
+                st.download_button(
+                    "📥 Download JSON",
+                    json.dumps(json_data, indent=2),
+                    "batch_bbb_predictions.json",
+                    "application/json",
+                    use_container_width=True
+                )
+            
+            st.stop()
+    
+    st.markdown("---")
 
     if predict_btn and user_input:
         smiles, name, err = resolve_input(user_input)
