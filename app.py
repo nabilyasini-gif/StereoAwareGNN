@@ -19,6 +19,7 @@ import json
 import base64
 import io
 import os
+import tempfile
 
 # Page config - MUST be first Streamlit command
 st.set_page_config(
@@ -633,27 +634,43 @@ def parse_uploaded_file(uploaded_file):
         elif filename.endswith('.sdf'):
             # Read SDF file using RDKit
             if RDKIT_AVAILABLE:
-                import tempfile
                 # Write to temporary file for RDKit to read
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.sdf', delete=False) as tmp:
-                    content = uploaded_file.read().decode('utf-8')
-                    tmp.write(content)
-                    tmp_path = tmp.name
-                
+                # SDF files can be text, but we'll handle both cases
                 try:
-                    suppl = Chem.SDMolSupplier(tmp_path)
+                    content = uploaded_file.read()
+                    # Try to decode as UTF-8, if it fails, keep as bytes
+                    if isinstance(content, bytes):
+                        try:
+                            content_str = content.decode('utf-8')
+                        except UnicodeDecodeError:
+                            content_str = content.decode('latin-1')
+                    else:
+                        content_str = content
                     
-                    for idx, mol in enumerate(suppl):
-                        if mol is not None:
-                            smiles = Chem.MolToSmiles(mol)
-                            # Try to get name from molecule properties
-                            name = mol.GetProp('_Name') if mol.HasProp('_Name') else f"Molecule_{idx+1}"
-                            if not name or name.strip() == '':
-                                name = f"Molecule_{idx+1}"
-                            smiles_list.append((smiles, name))
-                finally:
-                    # Clean up temporary file
-                    os.unlink(tmp_path)
+                    # Use context manager for proper cleanup
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.sdf', delete=False) as tmp:
+                        tmp.write(content_str)
+                        tmp_path = tmp.name
+                    
+                    try:
+                        suppl = Chem.SDMolSupplier(tmp_path)
+                        
+                        for idx, mol in enumerate(suppl):
+                            if mol is not None:
+                                smiles = Chem.MolToSmiles(mol)
+                                # Try to get name from molecule properties
+                                name = mol.GetProp('_Name') if mol.HasProp('_Name') else f"Molecule_{idx+1}"
+                                if not name or name.strip() == '':
+                                    name = f"Molecule_{idx+1}"
+                                smiles_list.append((smiles, name))
+                    finally:
+                        # Clean up temporary file
+                        try:
+                            os.unlink(tmp_path)
+                        except:
+                            pass  # Ignore errors during cleanup
+                except Exception as e:
+                    return None, f"Error processing SDF file: {str(e)}"
             else:
                 return None, "RDKit required for SDF files"
         
