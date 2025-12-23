@@ -28,6 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+pip install rdkit
 # RDKit imports
 try:
     from rdkit import Chem
